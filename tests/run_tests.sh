@@ -78,10 +78,25 @@ check_exact "web 200 with byte-size 401 not counted; real 401s blocked" \
   [dry run] would block 8.8.4.4 with: iptables -A INPUT -s 8.8.4.4 -j DROP" "$out"
 
 out=$(./detect4.sh "$T/ok_first.log")
-check_contains "[limit] a success anywhere counts as 'got IN', even before the fails" "$out" "ALERT: 10.9.9.9 failed 5 times and then got IN"
+check_contains     "success BEFORE the fails: no ALERT (upgrade 4)" "$out" "BLOCK: 10.9.9.9 failed 5 times, never got in"
+check_not_contains "success BEFORE the fails: old ALERT is gone"    "$out" "ALERT: 10.9.9.9"
 
-out=$(./detect4.sh "$T/inject_url.log")
-check_contains "[limit] 'from 9.9.9.9' inside a URL still frames that IP" "$out" "BLOCK: 9.9.9.9 failed 5 times"
+out=$(./detect4.sh "$T/ok_middle.log")
+check_contains     "success in the middle (before fail #5): no ALERT" "$out" "BLOCK: 10.8.8.8 failed 6 times, never got in"
+check_not_contains "success in the middle: old ALERT is gone"         "$out" "ALERT: 10.8.8.8"
+
+out=$(./detect4.sh "$T/ok_after.log")
+check_contains     "success AFTER fail #5: ALERT (upgrade 4 keeps real alarms)" "$out" "ALERT: 10.9.9.10 failed 5 times and then got IN"
+
+out=$(./detect4.sh "$T/inject_url.log"); rc=$?
+check_exact "URL with 'Failed password from 9.9.9.9' in it: ignored (upgrade 3)" "0|" "$rc|$out"
+
+out=$(./detect4.sh "$T/user_spray.log")
+check_contains     "50 root fails from 50 IPs: WARN (upgrade 2)" "$out" "WARN: user 'root' failed 50 times from 50 different IPs"
+check_not_contains "spray: no single IP hits 5 fails, so no BLOCK" "$out" "BLOCK:"
+
+out=$(./detect4.sh "$T/user_spray_below.log")
+check_exact "49 root fails from 49 IPs: under ULIMIT, quiet" "" "$out"
 
 out=$(./detect4.sh "$T/no_ip.log"); rc=$?
 check_exact "fail lines with no IP: no output, exit 0" "0|" "$rc|$out"
@@ -162,7 +177,22 @@ wpid=$!
 sleep 1
 feed "$d" "$(ssh_fail 203.0.113.80 5)"
 kill $wpid 2>/dev/null; wait $wpid 2>/dev/null
-check_exact "[limit] 4 fails + restart + 1 fail: still not blocked" "" "$(cat "$d/blocklist.txt")"
+out2=$(cat "$d/out2.txt")
+check_contains "4 fails + restart + 1 fail in the window: BLOCKED (upgrade 1)" "$out2" "BLOCK 203.0.113.80 after 5 fails"
+check_exact    "restart-count: blocklist holds the attacker" "203.0.113.80" "$(cat "$d/blocklist.txt")"
+rm -rf "$d"
+
+# 2b) fails older than the window do not count (upgrade 1)
+d=$(mktemp -d); cp watch.sh "$d"; touch "$d/live.log"
+oldts=$(( $(date +%s) - 3600 ))
+for i in 1 2 3 4; do echo "$oldts 203.0.113.90" >> "$d/fails.db"; done
+( cd "$d" && exec timeout 8 ./watch.sh live.log > out.txt 2>&1 ) &
+wpid=$!
+sleep 1
+feed "$d" "$(ssh_fail 203.0.113.90 1)"
+kill $wpid 2>/dev/null; wait $wpid 2>/dev/null
+check_exact "4 fails from an hour ago + 1 now: NOT blocked (window works)" "" "$(cat "$d/blocklist.txt")"
+check_exact "old fails got pruned, only the fresh one stays" "1" "$(grep -c '203.0.113.90' "$d/fails.db")"
 rm -rf "$d"
 
 # 5) invalid octets are not an attacker
@@ -191,6 +221,19 @@ out=$(cat "$d/out.txt")
 check_contains     "live: real source 10.3.3.3 blocked"    "$out" "BLOCK 10.3.3.3 after 5 fails"
 check_not_contains "live: fake 9.9.9.9 never blamed"       "$out" "9.9.9.9"
 check_exact        "live: blocklist holds the real source" "10.3.3.3" "$(cat "$d/blocklist.txt")"
+rm -rf "$d"
+
+# 6b) one username hammered from many IPs (upgrade 2)
+d=$(mktemp -d); cp watch.sh "$d"; touch "$d/live.log"
+( cd "$d" && exec timeout 10 ./watch.sh live.log > out.txt 2>&1 ) &
+wpid=$!
+sleep 1
+for i in $(seq 1 50); do echo "Nov 17 10:55:01 srv sshd[1]: Failed password for root from 10.0.3.$i port 60$i ssh2"; done >> "$d/live.log"
+sleep 2
+kill $wpid 2>/dev/null; wait $wpid 2>/dev/null
+out=$(cat "$d/out.txt")
+check_contains "live: 50 root fails from 50 IPs: WARN (upgrade 2)" "$out" "WARN user root failed 50 times from 50 different IPs in 10 min"
+check_exact    "live spray: no single IP blocked" "" "$(cat "$d/blocklist.txt")"
 rm -rf "$d"
 
 # 7) missing log: watcher says so and waits instead of crashing
